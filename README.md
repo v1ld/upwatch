@@ -8,7 +8,7 @@ Install or update: `bash install.sh` (from this folder). Remove: `bash install.s
 ## Files
 - `~/.local/bin/upwatch`: the app
 - `~/.config/upwatch/config.toml`: the sources (`upwatch init` writes a commented example)
-- `~/.config/systemd/user/upwatch.{service,timer}`: runs `upwatch check --notify --quiet` every 6 hours (and 10 min after boot)
+- `~/.config/systemd/user/upwatch.{service,timer}`: runs `upwatch check --notify --quiet` 2 min after login and every 6 hours
 - `~/.local/state/upwatch/state.json`: acknowledged versions, what was already notified
 - `~/.cache/upwatch/`: Nexus metadata cache
 

@@ -42,7 +42,8 @@ fi
 command -v notify-send >/dev/null || echo "NOTE: notify-send not found; notifications fall back to gdbus. For notify-send: sudo pacman -S libnotify"
 
 systemctl --user daemon-reload
-systemctl --user enable --now upwatch.timer
+systemctl --user enable upwatch.timer
+systemctl --user restart upwatch.timer   # picks up a changed timer file
 echo
 echo "== timer"; systemctl --user list-timers upwatch.timer --no-pager | head -3
 echo
