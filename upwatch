@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""upwatch: check things you care about for new versions (GitHub releases and commits, Nexus Mods pages, and
+lists of mods kept in other files), print what changed and optionally pop up a desktop notification.
+
+Config: $XDG_CONFIG_HOME/upwatch/config.toml (default ~/.config/upwatch/config.toml); `upwatch init` writes an
+example. State (what you have acknowledged, what was notified): $XDG_STATE_HOME/upwatch/state.json. Caches:
+$XDG_CACHE_HOME/upwatch/. Only the Python standard library is used (Python 3.11 or newer for tomllib).
+
+usage:
+  upwatch [check] [NAME ...] [--top] [--tag TAG ...] [--games] [-v] [--json] [--notify] [--quiet]
+  upwatch list [NAME ...] [--top] [--tag TAG ...] [--games]      show what would be checked (no network)
+  upwatch ack NAME ...       accept the latest version of NAME as yours (for sources without an installed version)
+  upwatch init               write an example config if none exists
+
+NAME is a source name from the config ("ge-proton", "tw3"), a list member as SOURCE/ID ("tw3/modSmartCamera"), or a
+member's id or label alone. --top checks the standalone sources only and skips what lists point to; --tag keeps
+sources carrying that tag (a list's members inherit its tags); --games is --tag game.
+
+Output, one line per item:  "U name (installed -> latest)  link"  update;  ". name (version)"  up to date (-v only);
+"= name (...)"  newer version held back on purpose (-v only);  "! name: ..."  archive not found on Nexus for this mod;
+"E name: ..."  the lookup failed.
+"""
+import fnmatch, glob, json, os, re, shlex, shutil, stat, subprocess, sys, time, tomllib, urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+UA = 'upwatch/1.0'
+XDG = lambda var, dflt: os.path.join(os.environ.get(var) or os.path.expanduser(dflt), 'upwatch')
+CONFIG = os.path.join(XDG('XDG_CONFIG_HOME', '~/.config'), 'config.toml')
+STATE = os.path.join(XDG('XDG_STATE_HOME', '~/.local/state'), 'state.json')
+CACHE = XDG('XDG_CACHE_HOME', '~/.cache')
+LIMITS = {}
+
+EXAMPLE = '''# upwatch config. Each [[source]] is one thing to watch, or (type = "list") a file that lists more things.
+# Common keys: name (unique, used on the command line), type, tags = [...], enabled = true|false.
+
+[settings]
+# Nexus Mods personal API key file (owner-only permissions). Needed only by Nexus sources.
+nexus_key_file = "~/.config/nexus-apikey"
+# Optional GitHub token file: anonymous use allows 60 API calls an hour, plenty for a few sources.
+# github_token_file = "~/.config/upwatch/github-token"
+
+[[source]]
+name = "ge-proton"
+type = "github-release"
+repo = "GloriousEggroll/proton-ge-custom"
+tags = ["proton"]
+# Installed version, found from what is on disk: an install whose folder name contains the latest tag is current.
+installed_glob = "~/.local/share/Steam/compatibilitytools.d/GE-Proton*"
+
+[[source]]
+name = "cachyos-proton"
+type = "github-release"
+repo = "CachyOS/proton-cachyos"
+tags = ["proton"]
+installed_glob = "~/.local/share/Steam/compatibilitytools.d/proton-cachyos*"
+# Or ask a command, e.g. the Arch package:  installed_cmd = "pacman -Q proton-cachyos"
+
+# A file that tracks more entities: the mod list the Witcher 3 layer writes (Nexus pages and GitHub repos).
+# The results are also written to nexus-status.json beside it, as the old nexus-check.py did.
+[[source]]
+name = "tw3"
+type = "list"
+format = "nexus-check"
+file = "~/path/to/nexus-check.json"
+game = "witcher3"
+tags = ["game"]
+
+# Other types:
+#   type = "github-commit"   repo = "owner/name"  branch = "main"        (newest commit on a branch)
+#   type = "nexus"           game = "witcher3"  mod_id = 1234  installed = "1.2"   (one Nexus page; without
+#                            installed, `upwatch ack NAME` records the version you have)
+# For any type without a way to know the installed version, the first check records the latest version as
+# yours, and later versions show as updates until you run `upwatch ack NAME`.
+'''
+
+
+# ---------------------------------------------------------------- helpers
+
+def http_json(url, headers, service):
+    req = urllib.request.Request(url, headers=dict({'User-Agent': UA}, **headers))
+    with urllib.request.urlopen(req, timeout=30) as r:
+        if service == 'nexus':
+            LIMITS['nexus'] = (r.headers.get('x-rl-hourly-remaining'), r.headers.get('x-rl-hourly-limit'),
+                               r.headers.get('x-rl-daily-remaining'), r.headers.get('x-rl-daily-limit'))
+        else:
+            LIMITS['github'] = (r.headers.get('x-ratelimit-remaining'), r.headers.get('x-ratelimit-limit'))
+        return json.load(r)
+
+
+def secret(path, what):
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise RuntimeError(f'no {what} file {path}')
+    if os.stat(path).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError(f'{path} is readable by others; run: chmod 600 {path}')
+    return open(path).read().strip()
+
+
+def first_word(v):
+    return ((v or '').split() or [''])[0].lstrip('vV')
+
+
+def norm(s):
+    return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+
+def line_key(name):
+    """A file's name with version numbers taken out ("CWSO 1.4.9c (Asi)" -> "cwso"), to follow a file line across renames."""
+    if not name:
+        return ''
+    k = re.sub(r'\([^)]*\)', ' ', name)
+    k = re.sub(r'(?i)(?<![a-z0-9])v?\d+(?:\.\d+)*[a-z]?(?![a-z0-9])', ' ', k)
+    return ' '.join(re.sub(r'[\s_\-.()]+', ' ', k).split()).lower()
+
+
+class Ctx:
+    """Shared by all checks of one run: settings, state, caches."""
+    def __init__(self, settings, state):
+        self.settings, self.state = settings, state
+        self._nexus_key = self._gh_token = None
+
+    def gh(self, path):
+        h = {'Accept': 'application/vnd.github+json'}
+        tf = self.settings.get('github_token_file')
+        if tf:
+            if self._gh_token is None:
+                self._gh_token = secret(tf, 'GitHub token')
+            h['Authorization'] = 'Bearer ' + self._gh_token
+        return http_json('https://api.github.com/repos/' + path, h, 'github')
+
+    def nexus(self, game, path):
+        if self._nexus_key is None:
+            kf = self.settings.get('nexus_key_file', '~/.config/nexus-apikey')
+            self._nexus_key = secret(kf, 'Nexus API key')
+        h = {'apikey': self._nexus_key, 'Application-Name': 'upwatch', 'Application-Version': '1.0', 'Accept': 'application/json'}
+        return http_json(f'https://api.nexusmods.com/v1/games/{game}/{path}', h, 'nexus')
+
+
+# ---------------------------------------------------------------- installed-version helpers
+
+def installed_from(src):
+    """(installed text, list of names to match the latest version against) from installed / installed_glob /
+    installed_cmd; (None, None) when the source does not say."""
+    if src.get('installed'):
+        return src['installed'], [src['installed']]
+    if src.get('installed_glob'):
+        paths = sorted(glob.glob(os.path.expanduser(src['installed_glob'])), key=os.path.getmtime)
+        names = [os.path.basename(p) for p in paths]
+        return (names[-1] if names else 'none installed'), names
+    if src.get('installed_cmd'):
+        try:
+            out = subprocess.run(src['installed_cmd'], shell=True, capture_output=True, text=True, timeout=30).stdout.strip()
+        except subprocess.TimeoutExpired:
+            out = ''
+        if src.get('installed_regex'):
+            m = re.search(src['installed_regex'], out)
+            out = m.group(1) if m and m.groups() else (m.group(0) if m else '')
+        return (out or 'none installed'), [out] if out else []
+    return None, None
+
+
+def matches_installed(latest, names):
+    """Is the latest version among what is installed? Names match when equal or when one contains the other once
+    case and punctuation are dropped ("GE-Proton10-25" in folder "GE-Proton10-25"; "10.0-20250714" in a package
+    version "1:10.0.20250714-1" does not: punctuation is dropped, so 10020250714 is compared)."""
+    lv = norm(latest.lstrip('vV'))
+    return any(lv and (lv == norm(n) or lv in norm(n) or norm(n.lstrip('vV')) == lv) for n in names if n)
+
+
+def judge(r, path, ctx, latest, names, inst):
+    """Fill installed/update for a result. Without an installed version, compare with the acknowledged one; the first
+    sighting becomes the acknowledged version."""
+    if names is not None:
+        r.update(installed=inst, update=not matches_installed(latest, names))
+        return
+    acked = ctx.state.setdefault('acked', {})
+    if path not in acked:
+        acked[path] = latest
+        r['note'] = 'first check: recorded as yours'
+    r.update(installed=acked[path], update=acked[path] != latest)
+
+
+# ---------------------------------------------------------------- source types
+
+def check_github_release(src, path, ctx):
+    repo = src['repo']
+    pre, pat = src.get('include_prereleases', False), src.get('tag_pattern')
+    if not pre and not pat:
+        rel = ctx.gh(f'{repo}/releases/latest')
+    else:
+        rels = [x for x in ctx.gh(f'{repo}/releases?per_page=30') if not x.get('draft')
+                and (pre or not x.get('prerelease')) and (not pat or re.search(pat, x.get('tag_name', '')))]
+        if not rels:
+            raise RuntimeError('no matching release')
+        rel = max(rels, key=lambda x: x.get('published_at') or '')
+    latest = rel.get('tag_name') or rel.get('name') or ''
+    r = dict(latest=latest, link=rel.get('html_url') or f'https://github.com/{repo}/releases',
+             date=(rel.get('published_at') or '')[:10])
+    inst, names = installed_from(src)
+    judge(r, path, ctx, latest, names, inst)
+    return r
+
+
+def check_github_commit(src, path, ctx):
+    repo, br = src['repo'], src.get('branch')
+    c = ctx.gh(f'{repo}/commits?per_page=1' + (f'&sha={br}' if br else ''))[0]
+    latest = f"{c['commit']['committer']['date'][:10]} ({c['sha'][:7]})"
+    r = dict(latest=latest, link=f'https://github.com/{repo}/commits' + (f'/{br}' if br else ''))
+    inst, names = installed_from(src)
+    if names is not None:   # an installed commit id: compare by sha prefix
+        have = inst.split('(')[-1].rstrip(')').strip()
+        r.update(installed=inst, update=not (have and c['sha'].startswith(have)))
+    else:
+        judge(r, path, ctx, latest, None, None)
+    return r
+
+
+def check_nexus(src, path, ctx):
+    game, mid = src.get('game', 'witcher3'), src['mod_id']
+    files = ctx.nexus(game, f'mods/{mid}/files.json')['files']
+    pick = [f for f in files if f.get('category_name') in ('MAIN', 'UPDATE')] or files
+    if src.get('file_name'):
+        pick = [f for f in pick if fnmatch.fnmatch(f.get('name') or '', src['file_name'])] or pick
+    last = max(pick, key=lambda f: f.get('uploaded_timestamp', 0))
+    latest = last.get('version') or ''
+    r = dict(latest=latest, link=f'https://www.nexusmods.com/{game}/mods/{mid}?tab=files&file_id={last.get("file_id")}',
+             date=(last.get('uploaded_time') or '')[:10])
+    if src.get('installed'):
+        r.update(installed=src['installed'], update=first_word(latest) != first_word(src['installed']))
+    else:
+        judge(r, path, ctx, latest, None, None)
+    return r
+
+
+def gh_member(m, ctx):
+    """GitHub member of a nexus-check list: newest release (tag, leading 'v' dropped) against the installed
+    version; a version '2024-03-15 (6ea408d)' is a commit: is the release that commit? A repo without releases is
+    compared by its newest commit."""
+    repo, inst = m['repo'], m['version']
+    have = inst.split('(')[-1].rstrip(')').strip() if '(' in inst else ''
+    try:
+        rel = ctx.gh(f'{repo}/releases/latest')
+        tag = rel.get('tag_name') or ''
+        update = (not ctx.gh(f'{repo}/commits/{tag}')['sha'].startswith(have)) if have else first_word(tag) != first_word(inst)
+        return dict(latest=tag.lstrip('vV'), update=update, link=rel.get('html_url') or f'https://github.com/{repo}/releases')
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    c = ctx.gh(f'{repo}/commits?per_page=1')[0]
+    return dict(latest=f"{c['commit']['committer']['date'][:10]} ({c['sha'][:7]})",
+                update=not (have and c['sha'].startswith(have)), link=f'https://github.com/{repo}/commits')
+
+
+INFO_TTL = 7 * 86400
+
+
+def check_list_nexus_check(src, members, ctx):
+    """A nexus-check.json file (written by the Witcher 3 layer's compose.py): Nexus mods with installed version and
+    archive md5, plus GitHub repos. Follows the archive's own file line on the Nexus page, checks the archive's md5
+    is a Nexus file of that mod (provenance), fetches changelogs for updates, and writes nexus-status.json beside the
+    file. Returns {member id: result}."""
+    fpath = os.path.expanduser(src['file'])
+    check = json.load(open(fpath))
+    game = src.get('game', 'witcher3')
+    want = {m['id'] for m in members}
+    mods = [m for m in check.get('mods', []) if m['id'] in want]
+    ghs = [m for m in check.get('github', []) if m['id'] in want]
+    os.makedirs(CACHE, exist_ok=True)
+    cpath = os.path.join(CACHE, f'nexus-cache-{game}.json')
+    try:
+        cache = json.load(open(cpath))
+    except (OSError, ValueError):
+        cache = {}
+    cache.setdefault('md5', {}); cache.setdefault('info', {})
+    now = time.time()
+    pages = sorted({m['nexus_id'] for m in mods})
+    jobs = {('files', i): f'mods/{i}/files.json' for i in pages}
+    jobs.update({('info', i): f'mods/{i}.json' for i in pages if now - cache['info'].get(str(i), {}).get('t', 0) > INFO_TTL})
+    jobs.update({('md5', x): f'mods/md5_search/{x}.json'
+                 for x in sorted({m['archive_md5'] for m in mods if m.get('archive_md5')} - set(cache['md5']))})
+    got, errs = {}, {}
+
+    def fetch(k):
+        try:
+            got[k] = ctx.nexus(game, jobs[k])
+        except urllib.error.HTTPError as e:
+            if k[0] == 'md5' and e.code == 404:
+                got[k] = []
+            else:
+                errs[k] = f'{type(e).__name__}: {e}'
+        except Exception as e:
+            errs[k] = f'{type(e).__name__}: {e}'
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(fetch, list(jobs)))
+    for (kind, k), v in got.items():
+        if kind == 'info':
+            cache['info'][str(k)] = {'t': now, 'd': v}
+        elif kind == 'md5':
+            cache['md5'][k] = v
+    logs, res, status = {}, {}, []
+    for m in mods:
+        r = {'id': m['id'], 'label': m.get('label'), 'nexus_id': m['nexus_id'], 'installed': m['version']}
+        try:
+            nid = m['nexus_id']
+            for k in (('files', nid), ('info', nid), ('md5', m.get('archive_md5'))):
+                if k in errs:
+                    raise RuntimeError(errs[k])
+            info = cache['info'].get(str(nid), {}).get('d', {})
+            files = got[('files', nid)]['files']
+            last = max([f for f in files if f.get('category_name') in ('MAIN', 'UPDATE')] or files,
+                       key=lambda f: f.get('uploaded_timestamp', 0))
+            r.update(author=info.get('author'), uploaded_by=info.get('uploaded_by'), created=info.get('created_time'),
+                     endorsements=info.get('endorsement_count'), status=info.get('status'), available=info.get('available'))
+            fd = []
+            if m.get('archive_md5'):
+                hits = cache['md5'].get(m['archive_md5'], [])
+                fd = [h.get('file_details', {}) for h in hits if (h.get('mod') or {}).get('mod_id') == nid]
+                r['provenance'] = {'archive_md5': m['archive_md5'], 'match': bool(fd),
+                                   'files': [{'file_name': f.get('file_name'), 'version': f.get('version'),
+                                              'uploaded': f.get('uploaded_time'), 'category': f.get('category_name')} for f in fd],
+                                   'other_mods': sorted({(h.get('mod') or {}).get('mod_id') for h in hits} - {nid})}
+            if fd:      # follow the archive's own file line (same name, version numbers ignored) on a page with several files
+                ids = {f.get('file_id') for f in fd}
+                names = {f.get('name') for f in files if f.get('file_id') in ids} or {f.get('name') for f in fd}
+                keys = {line_key(x) for x in names if x}
+                ln = [f for f in files if (f.get('name') in names or line_key(f.get('name')) in keys)
+                      and f.get('category_name') not in ('ARCHIVED', 'DELETED')] or [f for f in files if f.get('file_id') in ids]
+                if ln:
+                    last = max(ln, key=lambda f: f.get('uploaded_timestamp', 0))
+            update = first_word(last.get('version')) != first_word(m['version'])
+            changelog = []
+            if update:
+                if nid not in logs:
+                    logs[nid] = ctx.nexus(game, f'mods/{nid}/changelogs.json')
+                changelog = logs[nid].get(last.get('version') or '', []) if isinstance(logs[nid], dict) else []
+            r.update(name=info.get('name'), mod_version=info.get('version'), latest=last.get('version'),
+                     latest_file=last.get('file_name'), latest_file_id=last.get('file_id'), category=last.get('category_name'),
+                     uploaded=last.get('uploaded_time'), changelog=changelog,
+                     page=f'https://www.nexusmods.com/{game}/mods/{nid}', update=update,
+                     link=f'https://www.nexusmods.com/{game}/mods/{nid}?tab=files&file_id={last.get("file_id")}')
+            if 'provenance' in r and not r['provenance']['match']:
+                r['bad'] = 'archive md5 NOT FOUND on Nexus for this mod'
+        except Exception as e:
+            r['error'] = f'{type(e).__name__}: {e}'
+        status.append(r)
+        res[m['id']] = r
+
+    def one_gh(m):
+        try:
+            g = gh_member(m, ctx)
+        except Exception as e:
+            return m, {'error': f'{type(e).__name__}: {e}'}
+        return m, g
+    with ThreadPoolExecutor(4) as ex:
+        for m, g in ex.map(one_gh, ghs):
+            r = dict(id=m['id'], label=m['label'], github=m['repo'], installed=m['version'], **g)
+            if g.get('update') and m.get('hold'):
+                r['hold'] = m['hold']
+            status.append(r)
+            res[m['id']] = r
+    json.dump(cache, open(cpath, 'w'))
+    if len(members) == len(check.get('mods', [])) + len(check.get('github', [])):   # full run: refresh nexus-status.json
+        json.dump({'checked': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'mods': status},
+                  open(os.path.join(os.path.dirname(fpath), 'nexus-status.json'), 'w'), indent=1)
+    return res
+
+
+def members_nexus_check(src):
+    check = json.load(open(os.path.expanduser(src['file'])))
+    return ([{'id': m['id'], 'label': m.get('label') or m['id'], 'kind': 'nexus'} for m in check.get('mods', [])] +
+            [{'id': m['id'], 'label': m.get('label') or m['id'], 'kind': 'github'} for m in check.get('github', [])])
+
+
+SINGLE = {'github-release': check_github_release, 'github-commit': check_github_commit, 'nexus': check_nexus}
+LISTS = {'nexus-check': (members_nexus_check, check_list_nexus_check)}
+
+
+# ---------------------------------------------------------------- selection
+
+def load_config():
+    if not os.path.exists(CONFIG):
+        raise SystemExit(f'no config {CONFIG}; run: upwatch init')
+    with open(CONFIG, 'rb') as f:
+        cfg = tomllib.load(f)
+    srcs = [s for s in cfg.get('source', []) if s.get('enabled', True)]
+    seen = set()
+    for s in srcs:
+        if 'name' not in s or 'type' not in s:
+            raise SystemExit(f'{CONFIG}: every [[source]] needs name and type: {s}')
+        if s['name'] in seen:
+            raise SystemExit(f'{CONFIG}: duplicate source name {s["name"]}')
+        seen.add(s['name'])
+        if s['type'] == 'list' and s.get('format', 'nexus-check') not in LISTS:
+            raise SystemExit(f'{CONFIG}: {s["name"]}: unknown list format {s.get("format")}')
+        if s['type'] != 'list' and s['type'] not in SINGLE:
+            raise SystemExit(f'{CONFIG}: {s["name"]}: unknown type {s["type"]} (known: {", ".join(sorted(SINGLE))}, list)')
+    return cfg.get('settings', {}), srcs
+
+
+def select(srcs, names, top, tags):
+    """[(source, members or None)] to check. members is None for a standalone source, else the chosen list members."""
+    out, hit = [], set()
+    for s in srcs:
+        if tags and not set(tags) & set(s.get('tags', [])):
+            continue
+        if s['type'] != 'list':
+            if not names or s['name'] in names:
+                hit.add(s['name']) if names and s['name'] in names else None
+                out.append((s, None))
+            continue
+        if top:
+            continue
+        try:
+            mem = LISTS[s.get('format', 'nexus-check')][0](s)
+        except Exception as e:
+            out.append((s, e))
+            continue
+        if names and s['name'] not in names:
+            want = {n.lower() for n in names}
+            pick = [m for m in mem if f"{s['name']}/{m['id']}".lower() in want or m['id'].lower() in want or m['label'].lower() in want]
+            for n in names:
+                if any(n.lower() in (f"{s['name']}/{m['id']}".lower(), m['id'].lower(), m['label'].lower()) for m in pick):
+                    hit.add(n)
+            mem = pick
+        elif names:
+            hit.add(s['name'])
+        if mem:
+            out.append((s, mem))
+    missing = [n for n in names if n not in hit]
+    if missing:
+        raise SystemExit(f'no source or list member named: {", ".join(missing)} (see: upwatch list)')
+    return out
+
+
+# ---------------------------------------------------------------- run
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + '.tmp'
+    json.dump(st, open(tmp, 'w'), indent=1, sort_keys=True)
+    os.replace(tmp, STATE)
+
+
+def run_checks(settings, chosen, state):
+    ctx = Ctx(settings, state)
+    results = []     # (path, display name, result)
+
+    def one(item):
+        s, mem = item
+        if isinstance(mem, Exception):
+            return [(s['name'], s['name'], {'error': f'reading {s.get("file")}: {type(mem).__name__}: {mem}'})]
+        if mem is None:
+            try:
+                return [(s['name'], s['name'], SINGLE[s['type']](s, s['name'], ctx))]
+            except Exception as e:
+                return [(s['name'], s['name'], {'error': f'{type(e).__name__}: {e}'})]
+        try:
+            res = LISTS[s.get('format', 'nexus-check')][1](s, mem, ctx)
+        except Exception as e:
+            return [(s['name'], s['name'], {'error': f'{type(e).__name__}: {e}'})]
+        return [(f"{s['name']}/{m['id']}", m['label'], res.get(m['id'], {'error': 'no result'})) for m in mem]
+    with ThreadPoolExecutor(8) as ex:
+        for part in ex.map(one, chosen):
+            results.extend(part)
+    return results
+
+
+def line(name, r):
+    if r.get('error'):
+        return f"E {name}: {r['error']}"
+    inst = r.get('installed') or ''
+    if r.get('bad'):
+        return f"! {name} ({first_word(inst) or inst}): {r['bad']}"
+    if r.get('update') and r.get('hold'):
+        return f"= {name} ({first_word(inst)}, kept; {r['latest']} out: {r['hold']})"
+    if r.get('update'):
+        return f"U {name} ({inst} -> {r['latest']})  {r.get('link', '')}"
+    return f". {name} ({r.get('latest') if not inst or inst == 'none installed' else inst})" + (f"  [{r['note']}]" if r.get('note') else '')
+
+
+def notify(title, body, urgency='normal'):
+    if shutil.which('notify-send'):
+        subprocess.run(['notify-send', '-a', 'upwatch', '-i', 'software-update-available', '-u', urgency, title, body], check=False)
+    elif shutil.which('gdbus'):
+        subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.Notifications', '--object-path',
+                        '/org/freedesktop/Notifications', '--method', 'org.freedesktop.Notifications.Notify', 'upwatch', '0',
+                        'software-update-available', title, body, '[]', '{}', '-1'], check=False, capture_output=True)
+    else:
+        print('notify: neither notify-send (libnotify) nor gdbus found', file=sys.stderr)
+
+
+def send_notifications(results, state):
+    """One notification for updates not notified before (per item and latest version), one for lookups that newly
+    started failing. A version is notified once; an error once until the item works again."""
+    sent = state.setdefault('notified', {})
+    failing = state.setdefault('failing', {})
+    new, errs = [], []
+    for path, name, r in results:
+        if r.get('error'):
+            if path not in failing:
+                errs.append(f"{name}: {r['error']}")
+            failing[path] = r['error']
+            continue
+        failing.pop(path, None)
+        if r.get('update') and not r.get('hold') and sent.get(path) != r.get('latest'):
+            new.append(f"{name}: {r.get('installed')} → {r.get('latest')}")
+            sent[path] = r.get('latest')
+        elif not r.get('update'):
+            sent.pop(path, None)
+    if new:
+        notify(f"{len(new)} update{'s' if len(new) > 1 else ''} available", '\n'.join(new[:12]) + ('\n…' if len(new) > 12 else '') +
+               '\nRun: upwatch')
+    if errs:
+        notify('upwatch: lookups failing', '\n'.join(errs[:8]), 'low')
+
+
+def parse(argv):
+    cmd = argv[0] if argv and argv[0] in ('check', 'list', 'ack', 'init') else 'check'
+    rest = argv[1:] if argv and argv[0] == cmd else argv
+    o = dict(cmd=cmd, names=[], top=False, tags=[], verbose=False, json=False, notify=False, quiet=False)
+    it = iter(rest)
+    for a in it:
+        if a in ('-h', '--help'):
+            print(__doc__); sys.exit(0)
+        elif a == '--top': o['top'] = True
+        elif a == '--all': o['top'] = False
+        elif a == '--games': o['tags'].append('game')
+        elif a == '--tag': o['tags'].append(next(it, ''))
+        elif a.startswith('--tag='): o['tags'].append(a[6:])
+        elif a in ('-v', '--verbose'): o['verbose'] = True
+        elif a == '--json': o['json'] = True
+        elif a == '--notify': o['notify'] = True
+        elif a in ('-q', '--quiet'): o['quiet'] = True
+        elif a.startswith('-'): raise SystemExit(f'unknown option {a}; see upwatch --help')
+        else: o['names'].append(a)
+    return o
+
+
+def main(argv):
+    o = parse(argv)
+    if o['cmd'] == 'init':
+        if os.path.exists(CONFIG):
+            raise SystemExit(f'{CONFIG} exists; not overwriting')
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        open(CONFIG, 'w').write(EXAMPLE)
+        print(f'wrote {CONFIG}')
+        return 0
+    settings, srcs = load_config()
+    if o['cmd'] == 'ack':
+        if not o['names']:
+            raise SystemExit('usage: upwatch ack NAME ...')
+        state = load_state()
+        chosen = select(srcs, o['names'], o['top'], o['tags'])
+        byname = {s['name']: s for s in srcs}
+        for path, name, r in run_checks(settings, chosen, state):
+            if '/' in path:
+                print(f'{name}: list members take their installed version from the list file; nothing to record')
+                continue
+            if any(k in byname[path] for k in ('installed', 'installed_glob', 'installed_cmd')):
+                print(f'{name}: the installed version comes from the config ({r.get("installed")}); nothing to record')
+                continue
+            if r.get('error') or not r.get('latest'):
+                print(f'E {name}: {r.get("error", "no version")}')
+                continue
+            state.setdefault('acked', {})[path] = r['latest']
+            state.get('notified', {}).pop(path, None)
+            print(f'{name}: {r["latest"]} recorded as yours')
+        save_state(state)
+        return 0
+    chosen = select(srcs, o['names'], o['top'], o['tags'])
+    if o['cmd'] == 'list':
+        for s, mem in chosen:
+            extra = s.get('repo') or s.get('file') or (f"{s.get('game', 'witcher3')}/{s.get('mod_id')}" if s['type'] == 'nexus' else '')
+            print(f"{s['name']:20} {s['type'] if s['type'] != 'list' else 'list:' + s.get('format', 'nexus-check'):22} "
+                  f"{','.join(s.get('tags', [])):12} {extra}")
+            if isinstance(mem, Exception):
+                print(f"    E reading list: {mem}")
+            elif mem:
+                for m in mem:
+                    print(f"    {s['name']}/{m['id']:40} {m['kind']:7} {m['label']}")
+        return 0
+    t0 = time.time()
+    state = load_state()
+    results = run_checks(settings, chosen, state)
+    if o['notify']:
+        send_notifications(results, state)
+    state['last_run'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    save_state(state)
+    if o['json']:
+        print(json.dumps([dict(path=p, name=n, **r) for p, n, r in results], indent=1))
+        return 0
+    shown = 0
+    for path, name, r in results:
+        ln = line(name, r)
+        if o['verbose'] or ln[:1] in 'U!E':
+            if not (o['quiet'] and ln[:1] not in 'U!E'):
+                print(ln)
+                shown += ln[:1] in 'U!E'
+    if not shown and not o['quiet']:
+        print(f'no updates ({len(results)} checked)')
+    if o['verbose']:
+        n, g = LIMITS.get('nexus'), LIMITS.get('github')
+        if n:
+            print(f'Nexus API left: {n[0]}/{n[1]} this hour, {n[2]}/{n[3]} today')
+        if g:
+            print(f'GitHub API left: {g[0]}/{g[1]} this hour')
+        print(f'TIME {time.time() - t0:.1f} s')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

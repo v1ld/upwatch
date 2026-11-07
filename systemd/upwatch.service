@@ -1,0 +1,9 @@
+[Unit]
+Description=upwatch: check watched software for updates and notify
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/upwatch check --notify --quiet
+Nice=10
