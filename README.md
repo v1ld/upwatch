@@ -8,7 +8,7 @@ Install or update: `bash install.sh` (from this folder). Remove: `bash install.s
 ## Files
 - `~/.local/bin/upwatch`: the app
 - `~/.config/upwatch/config.toml`: the sources (`upwatch init` writes a commented example)
-- `~/.config/systemd/user/upwatch.{service,timer}`: runs `upwatch check --notify --quiet` 2 min after login and every 6 hours
+- `~/.config/systemd/user/upwatch.{service,timer}`: runs `upwatch check --notify --quiet --wait-network 300` 2 min after login and every 6 hours (waits up to 5 min for the network, retrying every 30 s)
 - `~/.local/state/upwatch/state.json`: acknowledged versions, what was already notified
 - `~/.cache/upwatch/`: Nexus metadata cache
 
@@ -37,6 +37,7 @@ upwatch tw3                one source; tw3/modSmartCamera or "Smart Camera" for 
 upwatch list [...]         what would be checked, no network
 upwatch ack ge-proton      accept the latest version (sources without an installed version)
 upwatch --json             results as JSON
+upwatch --wait-network 300 wait up to 300 s (retry every 30 s) for the API hosts
 systemctl --user start upwatch.service   run the notifying check now
 journalctl --user -u upwatch            its output
 ```

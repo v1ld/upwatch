@@ -7,20 +7,24 @@ example. State (what you have acknowledged, what was notified): $XDG_STATE_HOME/
 $XDG_CACHE_HOME/upwatch/. Only the Python standard library is used (Python 3.11 or newer for tomllib).
 
 usage:
-  upwatch [check] [NAME ...] [--top] [--tag TAG ...] [--games] [-v] [--json] [--notify] [--quiet]
+  upwatch [check] [NAME ...] [--top] [--tag TAG ...] [--games] [-v] [--json] [--notify] [--quiet] [--wait-network SECS]
   upwatch list [NAME ...] [--top] [--tag TAG ...] [--games]      show what would be checked (no network)
   upwatch ack NAME ...       accept the latest version of NAME as yours (for sources without an installed version)
   upwatch init               write an example config if none exists
 
 NAME is a source name from the config ("ge-proton", "tw3"), a list member as SOURCE/ID ("tw3/modSmartCamera"), or a
 member's id or label alone. --top checks the standalone sources only and skips what lists point to; --tag keeps
-sources carrying that tag (a list's members inherit its tags); --games is --tag game.
+sources carrying that tag (a list's members inherit its tags); --games is --tag game. --wait-network SECS waits up to
+SECS seconds for the network (a TCP connection to the hosts the sources use, tried every 30 s) before checking, and skips
+the check quietly if it never comes up: the timer uses it right after login, while the network is still coming up.
+With --notify, lookups that fail because the network is down are never notified; other failures (refused key, gone
+repo) are, once until they work again.
 
 Output, one line per item:  "U name (installed -> latest)  link"  update;  ". name (version)"  up to date (-v only);
 "= name (...)"  newer version held back on purpose (-v only);  "! name: ..."  archive not found on Nexus for this mod;
 "E name: ..."  the lookup failed.
 """
-import fnmatch, glob, json, os, re, shlex, shutil, stat, subprocess, sys, time, tomllib, urllib.error, urllib.request
+import fnmatch, glob, json, os, re, shlex, shutil, socket, stat, subprocess, sys, time, tomllib, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 UA = 'upwatch/1.0'
@@ -496,6 +500,10 @@ def notify(title, body, urgency='normal'):
         print('notify: neither notify-send (libnotify) nor gdbus found', file=sys.stderr)
 
 
+NETWORK_ERR = re.compile(r'URLError|TimeoutError|timed out|ConnectionError|ConnectionRefused|ConnectionReset|'
+                         r'Name or service not known|Temporary failure in name resolution|Network is unreachable|No route to host')
+
+
 def send_notifications(results, state):
     """One notification for updates not notified before (per item and latest version), one for lookups that newly
     started failing. A version is notified once; an error once until the item works again."""
@@ -504,6 +512,8 @@ def send_notifications(results, state):
     new, errs = [], []
     for path, name, r in results:
         if r.get('error'):
+            if NETWORK_ERR.search(r['error']):
+                continue        # the network was down: not worth a notification, and not a lasting failure
             if path not in failing:
                 errs.append(f"{name}: {r['error']}")
             failing[path] = r['error']
@@ -521,10 +531,32 @@ def send_notifications(results, state):
         notify('upwatch: lookups failing', '\n'.join(errs[:8]), 'low')
 
 
+def wait_network(srcs, secs):
+    """Wait until a TCP connection to every API host the chosen sources use succeeds, up to secs seconds."""
+    hosts = set()
+    for s, _ in srcs:
+        if s['type'].startswith('github') or s['type'] == 'list':
+            hosts.add('api.github.com')
+        if s['type'] in ('nexus', 'list'):
+            hosts.add('api.nexusmods.com')
+    end = time.time() + secs
+    for h in sorted(hosts):
+        while True:
+            try:
+                socket.create_connection((h, 443), timeout=5).close()
+                break
+            except OSError:
+                if time.time() >= end:
+                    print(f'network: {h} still unreachable after {secs} s; skipping this check', file=sys.stderr)
+                    return False
+                time.sleep(30)
+    return True
+
+
 def parse(argv):
     cmd = argv[0] if argv and argv[0] in ('check', 'list', 'ack', 'init') else 'check'
     rest = argv[1:] if argv and argv[0] == cmd else argv
-    o = dict(cmd=cmd, names=[], top=False, tags=[], verbose=False, json=False, notify=False, quiet=False)
+    o = dict(cmd=cmd, names=[], top=False, tags=[], verbose=False, json=False, notify=False, quiet=False, wait=0)
     it = iter(rest)
     for a in it:
         if a in ('-h', '--help'):
@@ -538,6 +570,8 @@ def parse(argv):
         elif a == '--json': o['json'] = True
         elif a == '--notify': o['notify'] = True
         elif a in ('-q', '--quiet'): o['quiet'] = True
+        elif a == '--wait-network': o['wait'] = int(next(it, '0'))
+        elif a.startswith('--wait-network='): o['wait'] = int(a.split('=', 1)[1])
         elif a.startswith('-'): raise SystemExit(f'unknown option {a}; see upwatch --help')
         else: o['names'].append(a)
     return o
@@ -587,6 +621,8 @@ def main(argv):
                     print(f"    {s['name']}/{m['id']:40} {m['kind']:7} {m['label']}")
         return 0
     t0 = time.time()
+    if o['wait'] and not wait_network(chosen, o['wait']):
+        return 0      # no network: skip quietly, the next timer run checks again
     state = load_state()
     results = run_checks(settings, chosen, state)
     if o['notify']:
