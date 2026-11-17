@@ -346,6 +346,10 @@ def check_list_nexus_check(src, members, ctx):
                 r['bad'] = 'archive md5 NOT FOUND on Nexus for this mod'
         except Exception as e:
             r['error'] = f'{type(e).__name__}: {e}'
+        # held on purpose: quiet only for the version turned down (hold_declined); a later version shows again
+        if r.get('update') and m.get('hold') and (not m.get('hold_declined') or
+                                                  first_word(r.get('latest')) == first_word(m['hold_declined'])):
+            r['hold'] = m['hold']
         status.append(r)
         res[m['id']] = r
 
