@@ -35,6 +35,18 @@ if [[ ! -e $cfg ]]; then
   if [[ ! -e $HOME/.config/nexus-apikey && -e $w3work/state/nexus-apikey ]]; then
     sed -i "s#^nexus_key_file = .*#nexus_key_file = \"$w3work/state/nexus-apikey\"#" "$cfg"
   fi
+  # its downloads/ inbox (beside work/; override with W3INBOX=...) is where `upwatch --fetch` puts tw3's new files,
+  # and work/store/archives is the archive of a want-list (`upwatch fetch FILE`)
+  if [[ -n $w3work ]]; then
+    w3inbox=${W3INBOX:-$(dirname "$w3work")/downloads}
+    if [[ -d $w3inbox ]]; then
+      sed -i "s#^\# fetch_dir = \"~/path/to/downloads-inbox\"#fetch_dir = \"$w3inbox\"#" "$cfg"
+      sed -i "s#^\# inbox_dir = .*#inbox_dir = \"$w3inbox\"#" "$cfg"
+    fi
+    if [[ -d $w3work/store/archives ]]; then
+      sed -i "s#^\# archive_dir = .*#archive_dir = \"$w3work/store/archives\"#" "$cfg"
+    fi
+  fi
 else
   echo "kept your config $cfg"
 fi

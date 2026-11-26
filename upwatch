@@ -8,6 +8,8 @@ $XDG_CACHE_HOME/upwatch/. Only the Python standard library is used (Python 3.11 
 
 usage:
   upwatch [check] [NAME ...] [--top] [--tag TAG ...] [--games] [-v] [--json] [--notify] [--quiet] [--wait-network SECS]
+  upwatch [check] [NAME ...] [...] --fetch [FETCH OPTIONS]   check, then fetch the Nexus file updates (see below)
+  upwatch fetch WANTS.json [FETCH OPTIONS]                    fetch the files a want-list names
   upwatch list [NAME ...] [--top] [--tag TAG ...] [--games]      show what would be checked (no network)
   upwatch ack NAME ...       accept the latest version of NAME as yours (for sources without an installed version)
   upwatch init               write an example config if none exists
@@ -19,13 +21,28 @@ SECS seconds for the network (a TCP connection to the hosts the sources use, tri
 the check quietly if it never comes up: the timer uses it right after login, while the network is still coming up.
 With --notify, lookups that fail because the network is down are never notified; other failures (refused key, gone
 repo) are, once until they work again.
+--fetch (in a terminal only; never with --notify, --quiet or --json) runs the check, then opens the Nexus file page of
+each update (not held, not failed) in your browser, a batch at a time, waits for YOUR click on each download, and moves
+each finished file it recognises from your Downloads folder to the fetch_dir of its source (or list). upwatch never
+downloads anything itself. A source without fetch_dir (and no fetch_dir in [settings]) is not fetched: one line says so.
+FETCH OPTIONS: --dry-run (show, open and move nothing), --yes (move matching files already in Downloads without asking),
+--batch N (pages per batch, default 10, at most 20), --gap MIN MAX (random seconds between two page openings, default
+1 2, MIN at least 1), --downloads DIR, --settle SECS (a file must hold still this long, default 2), --poll SECS,
+--report FILE (the full result as JSON), --opener CMD (open pages with CMD URL); for `fetch FILE` also --inbox-dir DIR
+and --archive-dir DIR. With -v the fetch summary also gives each file's path, how it was recognised and its md5.
+Fetch exit status: 0 everything in place, 1 something missing or not moved, 2 bad options or list, 130 Ctrl-C.
+--json prints one object per item: path, name (the name shown in the text output), and the item's own fields (a
+Nexus list member's mod page title is nexus_name; latest_size is the latest file's size in bytes, when Nexus gives it).
 
 Output, one line per item:  "U name (installed -> latest)  link"  update;  ". name (version)"  up to date (-v only);
 "= name (...)"  newer version held back on purpose (-v only);  "! name: ..."  archive not found on Nexus for this mod;
 "E name: ..."  the lookup failed.
 """
-import fnmatch, glob, json, os, re, shlex, shutil, socket, stat, subprocess, sys, time, tomllib, urllib.error, urllib.request
+import errno, fnmatch, glob, hashlib, json, math, os, random, re, shlex, shutil, signal, socket, stat, subprocess, sys, time
+import tomllib, urllib.error, urllib.parse, urllib.request, webbrowser
+import select as io_select     # (upwatch has its own select(): the sources to check)
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 UA = 'upwatch/1.0'
 XDG = lambda var, dflt: os.path.join(os.environ.get(var) or os.path.expanduser(dflt), 'upwatch')
@@ -42,6 +59,12 @@ EXAMPLE = '''# upwatch config. Each [[source]] is one thing to watch, or (type =
 nexus_key_file = "~/.config/nexus-apikey"
 # Optional GitHub token file: anonymous use allows 60 API calls an hour, plenty for a few sources.
 # github_token_file = "~/.config/upwatch/github-token"
+# For `upwatch --fetch`: where your browser saves downloads (default ~/Downloads). Each source or list names its own
+# destination with fetch_dir; a fetch_dir here would be the default for every Nexus source that names none.
+# downloads_dir = "~/Downloads"
+# For `upwatch fetch FILE` (a want-list): the folders its "inbox" and "archive" entries go to.
+# inbox_dir = "~/path/to/inbox"
+# archive_dir = "~/path/to/archives"
 
 [[source]]
 name = "ge-proton"
@@ -68,11 +91,13 @@ format = "nexus-check"
 file = "~/path/to/nexus-check.json"
 game = "witcher3"
 tags = ["game"]
+# where `upwatch --fetch` puts this list's new files (an existing folder); without it, this list is not fetched
+# fetch_dir = "~/path/to/downloads-inbox"
 
 # Other types:
 #   type = "github-commit"   repo = "owner/name"  branch = "main"        (newest commit on a branch)
 #   type = "nexus"           game = "witcher3"  mod_id = 1234  installed = "1.2"   (one Nexus page; without
-#                            installed, `upwatch ack NAME` records the version you have)
+#                            installed, `upwatch ack NAME` records the version you have; fetch_dir as for a list)
 # For any type without a way to know the installed version, the first check records the latest version as
 # yours, and later versions show as updates until you run `upwatch ack NAME`.
 '''
@@ -102,6 +127,12 @@ def secret(path, what):
 
 def first_word(v):
     return ((v or '').split() or [''])[0].lstrip('vV')
+
+
+def size_of(f):
+    """A Nexus file's exact size in bytes (files.json size_in_bytes), or None: the kB fields are not exact."""
+    v = f.get('size_in_bytes')
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
 
 def norm(s):
@@ -228,7 +259,10 @@ def check_nexus(src, path, ctx):
     last = max(pick, key=lambda f: f.get('uploaded_timestamp', 0))
     latest = last.get('version') or ''
     r = dict(latest=latest, link=f'https://www.nexusmods.com/{game}/mods/{mid}?tab=files&file_id={last.get("file_id")}',
-             date=(last.get('uploaded_time') or '')[:10])
+             date=(last.get('uploaded_time') or '')[:10], nexus_id=mid, latest_file=last.get('file_name'),
+             latest_file_id=last.get('file_id'))
+    if size_of(last) is not None:
+        r['latest_size'] = size_of(last)
     if src.get('installed'):
         r.update(installed=src['installed'], update=first_word(latest) != first_word(src['installed']))
     else:
@@ -342,6 +376,8 @@ def check_list_nexus_check(src, members, ctx):
                      uploaded=last.get('uploaded_time'), changelog=changelog,
                      page=f'https://www.nexusmods.com/{game}/mods/{nid}', update=update,
                      link=f'https://www.nexusmods.com/{game}/mods/{nid}?tab=files&file_id={last.get("file_id")}')
+            if size_of(last) is not None:
+                r['latest_size'] = size_of(last)
             if 'provenance' in r and not r['provenance']['match']:
                 r['bad'] = 'archive md5 NOT FOUND on Nexus for this mod'
         except Exception as e:
@@ -402,7 +438,13 @@ def load_config():
             raise SystemExit(f'{CONFIG}: {s["name"]}: unknown list format {s.get("format")}')
         if s['type'] != 'list' and s['type'] not in SINGLE:
             raise SystemExit(f'{CONFIG}: {s["name"]}: unknown type {s["type"]} (known: {", ".join(sorted(SINGLE))}, list)')
-    return cfg.get('settings', {}), srcs
+        if not isinstance(s.get('fetch_dir', ''), str):
+            raise SystemExit(f'{CONFIG}: {s["name"]}: fetch_dir must be a folder name in quotes')
+    settings = cfg.get('settings', {})
+    for k in ('fetch_dir', 'downloads_dir', 'inbox_dir', 'archive_dir'):
+        if not isinstance(settings.get(k, ''), str):
+            raise SystemExit(f'{CONFIG}: [settings] {k} must be a folder name in quotes')
+    return settings, srcs
 
 
 def select(srcs, names, top, tags):
@@ -557,11 +599,827 @@ def wait_network(srcs, secs):
     return True
 
 
+def as_json(results):
+    """The --json rows: path, name as shown, then the item's fields. A list member's own "name" (its Nexus page title)
+    becomes nexus_name, so the shown name is not lost or doubled."""
+    rows = []
+    for p, n, r in results:
+        r = dict(r)
+        if 'name' in r:
+            r['nexus_name'] = r.pop('name')
+        rows.append(dict(path=p, name=n, **r))
+    return rows
+
+
+# ---------------------------------------------------------------- fetch: begin
+# `upwatch --fetch` and `upwatch fetch FILE`. Nothing in this part talks to the network: it hands page addresses to
+# your browser (xdg-open, or Python's webbrowser), and every download is your own click on the page. It moves only
+# files it recognises, never overwrites, and removes a file from Downloads only once its move is in place.
+
+WANTS_FORMAT, WANTS_VERSION = 'upwatch-wants', 1
+PARTIAL_SUFFIXES = ('.part', '.crdownload', '.tmp', '.download', '.partial')
+COMPOUND_EXT = ('.tar.gz', '.tar.bz2', '.tar.xz', '.tar.zst')
+MAX_BATCH = 20
+TMP_TAG = '.upwatch-partial'
+NEXUS_HOSTS = ('www.nexusmods.com', 'nexusmods.com')
+HOW_TEXT = {'md5': 'by md5', 'name+size': 'by name+size', 'name': 'matched by name only'}
+FETCH_DEFAULTS = dict(dry_run=False, yes=False, batch=10, gap=[1.0, 2.0], downloads=None, settle=2.0, poll=1.0,
+                      opener=None, report=None, archive_dir=None, inbox_dir=None)
+
+
+class Stop:
+    """Ctrl-C: never in the middle of a move."""
+    requested = False
+    critical = 0
+
+
+def on_sigint(signum, frame):
+    Stop.requested = True
+    if not Stop.critical:
+        raise KeyboardInterrupt
+
+
+class critical:
+    """A Ctrl-C inside this block only sets Stop.requested; the caller acts on it after the block."""
+    def __enter__(self):
+        Stop.critical += 1
+
+    def __exit__(self, *exc):
+        Stop.critical -= 1
+        return False
+
+
+def stop_if_asked():
+    if Stop.requested:
+        raise KeyboardInterrupt
+
+
+def fetch_die(msg):
+    print(f'upwatch: {msg}', file=sys.stderr)
+    raise SystemExit(2)
+
+
+def nexus_url(game, mod_id, file_id):
+    return f'https://www.nexusmods.com/{game}/mods/{mod_id}?tab=files&file_id={file_id}'
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def check_entries(files, dests=None):
+    """(entries, problems) for a list of wanted files (the want-list's ENTRY format). dests: the allowed "dest" values
+    (a want-list: archive, inbox), or None when dest is already a folder (upwatch --fetch)."""
+    probs, entries, by_fid = [], [], {}
+    for i, raw in enumerate(files, 1):
+        where = f'entry {i}'
+        if not isinstance(raw, dict):
+            probs.append(f'{where}: not an object')
+            continue
+        e, p = dict(raw), []
+        if not isinstance(e.get('mod'), str) or not e['mod'].strip():
+            p.append('"mod" (a name) is required')
+        else:
+            where = f'entry {i} ({e["mod"]})'
+        e.setdefault('game', 'witcher3')
+        if not isinstance(e['game'], str) or not re.fullmatch(r'[a-z0-9]+', e['game']):
+            p.append('"game" must be a Nexus game domain such as "witcher3"')
+        for k in ('nexus_mod_id', 'file_id'):
+            if not _int(e.get(k)):
+                p.append(f'"{k}" must be a positive whole number')
+        fn = e.get('file_name')
+        if not isinstance(fn, str) or not fn or fn in ('.', '..') or '/' in fn or '\0' in fn or fn != fn.strip():
+            p.append('"file_name" must be a plain file name (no folder, no leading or trailing space)')
+        elif fn.endswith(PARTIAL_SUFFIXES):
+            p.append(f'"file_name" ends like a partial download ({fn})')
+        if e.get('size') is not None and not _int(e['size']):
+            p.append('"size" must be a positive whole number of bytes, or null')
+        if e.get('md5') is not None:
+            if not isinstance(e['md5'], str) or not re.fullmatch(r'[0-9a-fA-F]{32}', e['md5']):
+                p.append('"md5" must be 32 hex digits, or null')
+            else:
+                e['md5'] = e['md5'].lower()
+        if dests is not None and e.get('dest') not in dests:
+            p.append('"dest" must be ' + ' or '.join(f'"{d}"' for d in dests))
+        elif dests is None and not isinstance(e.get('dest'), str):
+            p.append('no destination folder')
+        if not p:
+            url = e.get('url') or nexus_url(e['game'], e['nexus_mod_id'], e['file_id'])
+            u = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+            if not u or u.scheme != 'https' or not u.netloc:
+                p.append('"url" must be an https address')
+            elif u.netloc.lower() in NEXUS_HOSTS:
+                q = urllib.parse.parse_qs(u.query)
+                m = re.search(r'/mods/(\d+)', u.path)
+                if q.get('file_id') and q['file_id'][0] != str(e['file_id']):
+                    p.append(f'"url" names file_id {q["file_id"][0]}, the entry {e["file_id"]}')
+                if m and m.group(1) != str(e['nexus_mod_id']):
+                    p.append(f'"url" names mod {m.group(1)}, the entry {e["nexus_mod_id"]}')
+            e['url'] = url
+        if p:
+            probs += [f'{where}: {x}' for x in p]
+            continue
+        prev = by_fid.get(e['file_id'])
+        if prev:
+            if (prev['file_name'], prev.get('size'), prev.get('md5')) != (e['file_name'], e.get('size'), e.get('md5')):
+                probs.append(f'{where}: file_id {e["file_id"]} appears twice with different name, size or md5')
+            elif prev['dest'] != e['dest']:
+                probs.append(f'{where}: file_id {e["file_id"]} appears twice with different destinations')
+            continue
+        by_fid[e['file_id']] = e
+        e.setdefault('size', None)
+        e.setdefault('md5', None)
+        entries.append(e)
+    seen = {}
+    for e in entries:
+        k = (e['dest'], e['file_name'])
+        if k in seen:
+            probs.append(f'{e["mod"]}: file_id {e["file_id"]} and {seen[k]} both want the name {e["file_name"]} in {e["dest"]}')
+        seen[k] = e['file_id']
+    return entries, probs
+
+
+def load_wants(path):
+    """The entries of a want-list file, or SystemExit(2) listing every problem."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except OSError as e:
+        fetch_die(f'cannot read the want-list {path}: {e.strerror}')
+    except ValueError as e:
+        fetch_die(f'the want-list {path} is not valid JSON: {e}')
+    if not isinstance(data, dict):
+        fetch_die(f'{path}: the want-list must be a JSON object with "format", "version" and "files"')
+    probs = []
+    if data.get('format') != WANTS_FORMAT:
+        probs.append(f'"format" must be "{WANTS_FORMAT}" (found {data.get("format")!r})')
+    ver = data.get('version')
+    if not _int(ver):
+        probs.append('"version" must be a whole number')
+    elif ver > WANTS_VERSION:
+        probs.append(f'format version {ver} is newer than this upwatch knows ({WANTS_VERSION}); use a newer upwatch')
+    files = data.get('files')
+    if not isinstance(files, list):
+        probs.append('"files" must be a list')
+        files = []
+    entries, p = check_entries(files, ('archive', 'inbox'))
+    probs += p
+    if probs:
+        fetch_die(f'{path}: the want-list has problems, nothing was done:\n  ' + '\n  '.join(probs))
+    return entries
+
+
+# ---- files
+
+MD5_CACHE = {}
+
+
+def md5_of(path, st=None):
+    st = st or os.stat(path)
+    key = (str(path), st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+    if key not in MD5_CACHE:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        MD5_CACHE[key] = h.hexdigest()
+    return MD5_CACHE[key]
+
+
+def split_ext(name):
+    low = name.lower()
+    for c in COMPOUND_EXT:
+        if low.endswith(c) and len(name) > len(c):
+            return name[:-len(c)], name[-len(c):]
+    stem, dot, ext = name.rpartition('.')
+    return (stem, '.' + ext) if dot and stem else (name, '')
+
+
+def name_match(candidate, expected):
+    """'exact', 'renamed' (a browser's "(1)" copy, or %20 for spaces) or None."""
+    if candidate == expected:
+        return 'exact'
+    stem, ext = split_ext(expected)
+    pat = re.compile(re.escape(stem) + r' ?\(\d{1,4}\)' + re.escape(ext) + r'\Z')
+    for c in {candidate, urllib.parse.unquote(candidate)}:
+        if c == expected or pat.match(c):
+            return 'renamed'
+    return None
+
+
+def modid_in(name, mod_id):
+    return re.search(r'(?<![0-9])' + str(mod_id) + r'(?![0-9])', name) is not None
+
+
+def is_partial_name(name, names):
+    if name.startswith('.') or name.endswith(PARTIAL_SUFFIXES):
+        return True
+    return any(name + s in names for s in PARTIAL_SUFFIXES)
+
+
+class Watcher:
+    """Looks at the top level of a folder; hands out files whose size and time held still across two looks at
+    least `settle` seconds apart, each (name, size, time) once."""
+    def __init__(self, folder, settle):
+        self.folder, self.settle = Path(folder), settle
+        self.seen = {}       # name -> (signature, first time seen with it)
+        self.given = {}      # name -> signature already handed out
+
+    def look(self):
+        now = time.monotonic()
+        try:
+            listing = list(os.scandir(self.folder))
+        except OSError as e:
+            print(f'  cannot read {self.folder}: {e.strerror}', file=sys.stderr)
+            return []
+        names = {d.name for d in listing}
+        out = []
+        for d in listing:
+            try:
+                if not d.is_file(follow_symlinks=False) or is_partial_name(d.name, names):
+                    continue
+                st = d.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_size == 0:
+                continue
+            sig = (st.st_size, st.st_mtime_ns, st.st_ino)
+            old = self.seen.get(d.name)
+            if not old or old[0] != sig:
+                self.seen[d.name] = (sig, now)
+                continue
+            if now - old[1] < self.settle or self.given.get(d.name) == sig:
+                continue
+            self.given[d.name] = sig
+            out.append((Path(d.path), st))
+        for n in list(self.seen):
+            if n not in names:
+                self.seen.pop(n)
+                self.given.pop(n, None)
+        return out
+
+
+def _no_hardlinks(e):
+    return e.errno in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS, errno.EACCES)
+
+
+def _place(src, target):
+    """Give src the name target without ever replacing an existing target. Raises FileExistsError."""
+    try:
+        os.link(src, target)
+        return 'link'
+    except FileExistsError:
+        raise
+    except OSError as e:
+        if e.errno == errno.EXDEV or not _no_hardlinks(e):
+            raise
+    if os.path.lexists(target):            # a filesystem without hard links: rename, after looking
+        raise FileExistsError(errno.EEXIST, 'exists', str(target))
+    os.rename(src, target)
+    return 'rename'
+
+
+def move_file(src, target, src_md5):
+    """Move src to target (which must not exist). Returns the md5 of the file at target."""
+    if os.environ.get('UPWATCH_TEST_FORCE_COPY') != '1':    # test hook only
+        try:
+            if _place(src, target) == 'link':
+                os.unlink(src)       # the content now lives under the new name; this only drops the old name
+            return src_md5
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+    return _copy_move(src, target, src_md5)
+
+
+def _copy_move(src, target, src_md5):
+    """Called inside critical(): a Ctrl-C during the copy aborts it, removes the unfinished copy, keeps the source."""
+    tmp = target.with_name('.' + target.name + TMP_TAG)
+    delay = float(os.environ.get('UPWATCH_TEST_COPY_DELAY') or 0)   # test hook only
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    done = False
+    try:
+        with os.fdopen(fd, 'wb') as out, open(src, 'rb') as inp:
+            for chunk in iter(lambda: inp.read(1 << 20), b''):
+                stop_if_asked()
+                out.write(chunk)
+                if delay:
+                    time.sleep(delay)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, tmp)
+        got = md5_of(tmp)                          # read back what is on the disk
+        if got != src_md5:
+            raise OSError(errno.EIO, f'the copy does not match its source (md5 {got}, source {src_md5})')
+        stop_if_asked()
+        _place(tmp, target)                        # never replaces an existing target
+        done = True
+        if os.path.lexists(tmp):
+            os.unlink(tmp)                         # our own temporary name; the file stays under target
+        os.unlink(src)                             # only now: the verified copy is in place
+    finally:
+        if not done and os.path.lexists(tmp):
+            os.unlink(tmp)                         # our own unfinished copy, never your file
+    return got
+
+
+def human(n):
+    if n is None:
+        return 'size ?'
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if n < 1024 or unit == 'GiB':
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024
+
+
+def title(e):
+    return f'{e["mod"]} {e["version"]}' if e.get('version') else e['mod']
+
+
+class Run:
+    def __init__(self, a, entries, dirs, skipped=()):
+        self.a, self.entries, self.dirs, self.v = a, entries, dirs, a['verbose']
+        self.downloads = Path(a['downloads'])
+        self.skipped = list(skipped)       # [(title, reason)]: updates not fetched, decided before the run
+        for e in entries:
+            e['state'] = 'wanted'      # wanted | present | fetched | conflict | declined
+            e['how'] = e['note_run'] = e['error'] = None
+            e['close'] = set()
+        self.moved, self.close, self.dups, self.unknown, self.conflicts, self.errors = [], {}, [], [], [], []
+        self.opened, self.last_open, self.children = [], None, []
+
+    # ---- the destination
+    def dest_index(self, kind):
+        idx = {}
+        try:
+            for x in os.scandir(self.dirs[kind]):
+                if x.is_file(follow_symlinks=False) and not x.name.endswith(TMP_TAG):
+                    idx.setdefault(x.stat().st_size, []).append(Path(x.path))
+        except OSError:
+            pass
+        return idx
+
+    def check_present(self):
+        idx = {k: self.dest_index(k) for k in self.dirs}
+        for e in self.entries:
+            t = self.dirs[e['dest']] / e['file_name']
+            if e['md5']:
+                same = [p for p in ([t] if t.is_file() else []) + idx[e['dest']].get(e['size'], [])
+                        if e['size'] is None or p.stat().st_size == e['size']]
+                for p in dict.fromkeys(same):
+                    if md5_of(p) == e['md5']:
+                        e['state'], e['how'] = 'present', 'md5' if p == t else f'md5, as {p.name}'
+                        break
+                else:
+                    if t.exists():
+                        e['note_run'] = f'{t} holds a different file (md5 differs): will not be overwritten'
+                        e['dest_conflict'] = True
+            elif t.is_file():
+                if e['size'] is None:
+                    e['state'], e['how'] = 'present', 'name'
+                elif t.stat().st_size == e['size']:
+                    e['state'], e['how'] = 'present', 'name+size'
+                else:
+                    e['note_run'] = f'{t} holds a different file ({human(t.stat().st_size)}): will not be overwritten'
+                    e['dest_conflict'] = True
+            elif t.exists():
+                e['note_run'] = f'{t} exists and is not a file: will not be touched'
+                e['dest_conflict'] = True
+
+    # ---- recognising a file in Downloads
+    def classify(self, path, st):
+        """[(entry, how)] for entries this file satisfies; records 'close' reasons for the others."""
+        name, size, hits = path.name, st.st_size, []
+        for e in self.entries:
+            nm = name_match(name, e['file_name'])
+            reason = None
+            if e['md5']:
+                if e['size'] is not None and size != e['size']:
+                    reason = 'right name, wrong size' if nm else None
+                elif e['size'] is not None or nm or modid_in(name, e['nexus_mod_id']):
+                    try:
+                        h = md5_of(path, st)
+                    except OSError:
+                        continue
+                    if h == e['md5']:
+                        hits.append((e, 'md5'))
+                        continue
+                    reason = 'right name, wrong md5' if nm else ('same size, other md5' if e['size'] is not None and modid_in(name, e['nexus_mod_id']) else None)
+            elif nm:
+                if e['size'] is None:
+                    hits.append((e, 'name'))
+                    continue
+                if size == e['size']:
+                    hits.append((e, 'name+size'))
+                    continue
+                reason = f'right name, wrong size ({size} bytes, the list says {e["size"]})'
+            if not reason and e['state'] == 'wanted' and modid_in(name, e['nexus_mod_id']):
+                reason = f'mod id {e["nexus_mod_id"]} in the name'
+            if reason:
+                self.close.setdefault(str(path), set()).add(f'{reason} [{e["mod"]}: {e["file_name"]}]')
+                e['close'].add(reason.split(' (')[0])
+        return hits
+
+    def handle(self, path, st, hits):
+        """Act on a recognised file. Returns True if it was moved."""
+        self.close.pop(str(path), None)
+        e, how = next(((e, h) for e, h in hits if e['state'] == 'wanted'), hits[0])
+        if e['state'] != 'wanted':
+            self.dups.append((path, f'{e["mod"]}: already {e["state"]}' + (f' ({HOW_TEXT.get(e["how"], e["how"])})' if e['how'] else '')))
+            return False
+        target = self.dirs[e['dest']] / e['file_name']
+        try:
+            src_md5 = md5_of(path, st)
+        except OSError as ex:
+            self.errors.append(f'{path}: cannot read: {ex.strerror}')
+            e['error'] = f'cannot read {path.name}'
+            return False
+        try:
+            st2 = os.stat(path)
+        except OSError:
+            return False
+        if (st2.st_size, st2.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+            return False                     # changed while being read: the next looks will see it again
+        if os.path.lexists(target):
+            if target.is_file() and md5_of(target) == src_md5:
+                e['state'], e['how'] = 'present', how
+                self.dups.append((path, f'{e["mod"]}: the same file is already at {target}'))
+            else:
+                e['state'], e['how'] = 'conflict', how
+                self.conflicts.append((e, path, target))
+                print(f'  ! {title(e)}: a different file of that name is already in the destination; both left as they are'
+                      + (f' ({path} vs {target})' if self.v else ''))
+            return False
+        try:
+            with critical():                 # moved and recorded together, or neither
+                got = move_file(path, target, src_md5)
+                e['state'], e['how'], e['path'], e['md5_got'] = 'fetched', how, str(target), got
+                self.moved.append((e, path.name, target, got))
+        except FileExistsError:
+            e['state'], e['how'] = 'conflict', how
+            self.conflicts.append((e, path, target))
+            print(f'  ! {title(e)}: a file of that name appeared in the destination meanwhile; nothing overwritten')
+            return False
+        except OSError as ex:
+            self.errors.append(f'{path.name} -> {target}: {ex.strerror or ex}; the file stays in Downloads')
+            e['error'] = f'move failed: {ex.strerror or ex}; the file stays in Downloads'
+            print(f'  E {title(e)}: {e["error"]}')
+            return False
+        print(f'  + {title(e)}: fetched' + (f'  {path.name} -> {target} ({HOW_TEXT[how]}; md5 {got})' if self.v else ''))
+        return True
+
+    def process(self, found, during_run=True):
+        for path, st in found:
+            hits = self.classify(path, st)
+            if hits:
+                self.handle(path, st, hits)
+                stop_if_asked()
+            elif during_run and str(path) not in self.close:
+                self.unknown.append(path.name)
+                if self.v:
+                    print(f'  ? {path.name}: not on the list, left alone')
+            elif during_run:
+                print(f'  ~ {path.name}: close to the list but not a match, left alone'
+                      + (f' ({"; ".join(sorted(self.close[str(path)]))})' if self.v else ''))
+
+    # ---- opening pages
+    def open_url(self, url):
+        gmin, gmax = self.a['gap']
+        if self.last_open is not None:
+            wait = random.uniform(gmin, gmax) - (time.monotonic() - self.last_open)
+            if wait > 0:
+                time.sleep(wait)
+        if self.a['opener']:
+            cmd = shlex.split(self.a['opener']) + [url]
+        else:
+            xdg = shutil.which('xdg-open')
+            cmd = [xdg, url] if xdg else None
+        ok = True
+        if cmd:
+            try:
+                self.children.append(subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                      stderr=subprocess.DEVNULL, start_new_session=True))
+            except OSError as ex:
+                ok = False
+                print(f'  E cannot run {cmd[0]}: {ex.strerror}')
+        else:
+            ok = webbrowser.open(url, new=2)
+        self.last_open = time.monotonic()
+        self.opened.append(url)
+        self.children = [c for c in self.children if c.poll() is None]
+        if not ok:
+            print(f'    open it yourself: {url}')
+
+    def open_batch(self, batch, number, total):
+        print(f'\n-- batch {number} of {total}: opening {len(batch)} page{"s" if len(batch) > 1 else ""}. '
+              f'Click the download on each page.')
+        for e in batch:
+            print(f'   {title(e)}' + (f': {e["file_name"]}  {e["url"]}' if self.v else ''))
+            self.open_url(e['url'])
+        print('   Watching Downloads. Enter: ' + ('next batch' if number < total else 'finish') + '. Ctrl-C: stop.')
+
+    def print_list(self):
+        if self.v:
+            print(f'Wanted files: {len(self.entries)}  (to: {"; ".join(f"{k}: {d}" if k != str(d) else str(d) for k, d in self.dirs.items())})')
+        for e in self.entries:
+            if self.v:
+                st = f'present ({HOW_TEXT.get(e["how"], e["how"])})' if e['state'] == 'present' else 'wanted'
+                print(f'  {"=" if e["state"] == "present" else "-"} {title(e)}  [{e["dest"]}]  {e["file_name"]}  '
+                      f'{human(e["size"])}  {"md5" if e["md5"] else "no md5"}  {st}')
+            if e['note_run']:
+                print(f'  ! {title(e)}: ' + (e['note_run'] if self.v else 'a different file of that name is already in the destination; it will not be overwritten'))
+            if e.get('note') and self.v:
+                print(f'      note: {e["note"]}')
+
+    def wanted(self):
+        return [e for e in self.entries if e['state'] == 'wanted']
+
+    # ---- the end
+    def outcome(self, e, interrupted):
+        """(status for the report, the short text after the mod's name)."""
+        s = e['state']
+        if s == 'fetched':
+            return 'fetched', 'fetched'
+        if s == 'present':
+            return 'present', 'skipped (already in place)'
+        if s == 'declined':
+            return 'declined', 'skipped (left in Downloads, as you chose)'
+        if s == 'conflict':
+            return 'conflict', 'FAILED (a different file of that name is in the destination; both left as they are)'
+        if e['error']:
+            return 'failed', f'FAILED ({e["error"]})'
+        if e['close']:
+            return 'missing', f'FAILED (in Downloads but not a match: {"; ".join(sorted(e["close"]))})'
+        return 'missing', 'FAILED (not downloaded' + ('; stopped by Ctrl-C)' if interrupted else ')')
+
+    def summary(self, interrupted):
+        out, items = [''], []
+        n = {'fetched': 0, 'skipped': len(self.skipped), 'failed': 0}
+        for t, why in self.skipped:
+            out.append(f'{t}: skipped ({why})')
+        for e in self.entries:
+            status, text = self.outcome(e, interrupted)
+            n['fetched' if status == 'fetched' else 'skipped' if status in ('present', 'declined') else 'failed'] += 1
+            out.append(f'{title(e)}: {text}')
+            target = self.dirs[e['dest']] / e['file_name']
+            if self.v:
+                if status == 'fetched':
+                    out.append(f'    {e["path"]}  ({HOW_TEXT[e["how"]]}; md5 {e["md5_got"]})')
+                elif status == 'present':
+                    out.append(f'    {target}  ({HOW_TEXT.get(e["how"], e["how"])})')
+                elif status in ('missing', 'declined'):
+                    out.append(f'    {e["file_name"]}  {e["url"]}')
+            items.append({'mod': e['mod'], 'id': e.get('id'), 'version': e.get('version'), 'status': status,
+                          'text': text, 'file_name': e['file_name'], 'file_id': e['file_id'],
+                          'nexus_mod_id': e['nexus_mod_id'], 'url': e['url'], 'dest': str(self.dirs[e['dest']]),
+                          'path': e.get('path') or (str(target) if status == 'present' else None), 'how': e['how'],
+                          'md5': e.get('md5_got') or e['md5']})
+        if self.v:
+            if self.close:
+                out.append(f'Left alone, looked close: {len(self.close)}')
+                for p, why in sorted(self.close.items()):
+                    out.append(f'  {Path(p).name}: {"; ".join(sorted(why))}')
+            if self.dups:
+                out.append(f'Left alone, a copy of something already in place: {len(self.dups)}')
+                for p, why in self.dups:
+                    out.append(f'  {p.name}: {why}')
+            if self.unknown:
+                out.append(f'New files in Downloads not on the list (left alone): {", ".join(self.unknown)}')
+            for x in self.errors:
+                out.append(f'Error: {x}')
+            out.append(f'Pages opened: {len(self.opened)}')
+        out.append(f'fetch: {n["fetched"]} fetched, {n["skipped"]} skipped, {n["failed"]} failed'
+                   + (' (stopped by Ctrl-C)' if interrupted else ''))
+        print('\n'.join(out))
+        miss = [e for e in self.entries if e['state'] in ('wanted', 'declined')]
+        if self.a['report']:
+            pres = [e for e in self.entries if e['state'] == 'present']
+            rep = {'format': 'upwatch-fetch-report', 'version': 1, 'interrupted': interrupted,
+                   'counts': n, 'items': items, 'skipped': [{'mod': t, 'reason': w} for t, w in self.skipped],
+                   'moved': [{'mod': e['mod'], 'file_id': e['file_id'], 'from': s, 'to': str(t), 'how': e['how'], 'md5': h}
+                             for e, s, t, h in self.moved],
+                   'present': [{'mod': e['mod'], 'file_id': e['file_id'], 'how': e['how']} for e in pres],
+                   'conflicts': [{'mod': e['mod'], 'file_id': e['file_id'], 'left': str(s), 'dest': str(t)} for e, s, t in self.conflicts],
+                   'missing': [{'mod': e['mod'], 'file_id': e['file_id'], 'url': e['url']} for e in miss],
+                   'close': {Path(p).name: sorted(w) for p, w in self.close.items()},
+                   'duplicates': [p.name for p, _ in self.dups], 'unknown': self.unknown, 'errors': self.errors,
+                   'opened': self.opened}
+            with open(self.a['report'], 'w', encoding='utf-8') as f:
+                json.dump(rep, f, indent=1)
+        if interrupted:
+            return 130
+        return 0 if not miss and not self.conflicts and not self.errors else 1
+
+
+def read_enter(timeout, stdin_open):
+    """Wait up to timeout seconds; True if Enter was pressed. Reads the terminal unbuffered, so that each Enter is
+    seen once. stdin_open is a one-item list, set False when standard input ends."""
+    if not stdin_open[0]:
+        time.sleep(timeout)
+        return False
+    try:
+        fd = sys.stdin.fileno()
+        r, _, _ = io_select.select([fd], [], [], timeout)
+        if not r:
+            return False
+        chunk = os.read(fd, 4096)
+    except (OSError, ValueError, AttributeError):
+        stdin_open[0] = False
+        return False
+    if not chunk:
+        stdin_open[0] = False
+        return False
+    return b'\n' in chunk
+
+
+def ask(prompt):
+    """A yes/no answer read straight from the terminal (see read_enter); no answer (end of input) is no."""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buf = b''
+    try:
+        fd = sys.stdin.fileno()
+        while b'\n' not in buf:
+            chunk = os.read(fd, 1)
+            if not chunk:
+                break
+            buf += chunk
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not buf:
+        print()
+        return False
+    return buf.decode(errors='replace').strip().lower() in ('', 'y', 'yes')
+
+
+def fetch_run(a, entries, dirs, skipped=()):
+    """Open the pages of the wanted files in batches and move what you download. Returns the exit status."""
+    r = Run(a, entries, dirs, skipped)
+    if not r.downloads.is_dir():
+        fetch_die(f'the Downloads folder {r.downloads} does not exist (downloads_dir in [settings], or --downloads)')
+    missing_dirs = sorted({str(dirs[e['dest']]) for e in entries if not dirs[e['dest']].is_dir()})
+    if missing_dirs and not a['dry_run']:
+        fetch_die('destination folder missing (create it, or fix the config): ' + '; '.join(missing_dirs))
+    old = signal.signal(signal.SIGINT, on_sigint)
+    interrupted = False
+    try:
+        r.check_present()
+        r.print_list()
+        for m in missing_dirs:
+            print(f'  ! destination folder missing: {m}')
+        w = Watcher(r.downloads, a['settle'])        # files already in Downloads: two looks, settle seconds apart
+        w.look()
+        time.sleep(a['settle'] + 0.05)
+        pre = [(path, st, hits) for path, st in w.look() for hits in [r.classify(path, st)] if hits]
+        if pre:
+            print(f'\nAlready in Downloads and on the list: {len(pre)}')
+            for path, st, hits in pre:
+                e, how = hits[0]
+                tail = (f', already {e["state"]}: stays in Downloads' if e['state'] != 'wanted' else
+                        ': a different file of that name is in the destination, so it stays in Downloads' if e.get('dest_conflict') else '')
+                print(f'  {title(e)}' + (f' ({path.name}, {HOW_TEXT[how]})' if r.v else '') + tail)
+        todo = [e for e in r.wanted() if not any(h[0] is e for _, _, hs in pre for h in hs)]
+        batches = math.ceil(len(todo) / a['batch']) if todo else 0
+        if a['dry_run']:
+            for t, why in r.skipped:
+                print(f'{t}: skipped ({why})')
+            for e in r.entries:
+                inpre = any(h[0] is e for _, _, hs in pre for h in hs)
+                print(f'{title(e)}: ' + ('already in place' if e['state'] == 'present' else
+                                         'in Downloads, would be moved' if inpre and not e.get('dest_conflict') else
+                                         'in Downloads, would stay (destination conflict)' if inpre else 'would open its page'))
+            if r.close and r.v:
+                print('\nIn Downloads, looked close (would be left alone):')
+                for p, why in sorted(r.close.items()):
+                    print(f'  {Path(p).name}: {"; ".join(sorted(why))}')
+            moved = sum(1 for p in pre if p[2][0][0]['state'] == 'wanted' and not p[2][0][0].get('dest_conflict'))
+            print(f'\nDry run: {len(todo)} click{"s" if len(todo) != 1 else ""} ahead ({batches} batch{"es" if batches != 1 else ""} '
+                  f'of up to {a["batch"]}); {moved} file(s) already in Downloads would be moved. Nothing opened, nothing moved.')
+            return 0
+        if pre:
+            go = a['yes'] or ask('Move these into place now? [Y/n] ')
+            for path, st, hits in pre:
+                if go:
+                    r.handle(path, st, hits)
+                    stop_if_asked()
+                else:
+                    for e, _ in hits:
+                        if e['state'] == 'wanted':
+                            e['state'] = 'declined'
+            todo = r.wanted()
+            batches = math.ceil(len(todo) / a['batch']) if todo else 0
+        if not todo:
+            print('\nNothing to download.')
+            return r.summary(False)
+        print(f'\n{len(todo)} file(s) to download in {batches} batch{"es" if batches != 1 else ""} of up to {a["batch"]}.')
+        queue, number, current, stdin_open, waiting_said = list(todo), 0, [], [True], False
+        while True:
+            if (not current or all(e['state'] != 'wanted' for e in current)) and queue:
+                current, queue = queue[:a['batch']], queue[a['batch']:]
+                number += 1
+                r.open_batch(current, number, batches)
+            r.process(w.look())
+            if not r.wanted():
+                print('\nEverything on the list is in place.')
+                break
+            if not queue and not waiting_said and all(e['state'] != 'wanted' for e in current):
+                waiting_said = True
+                print(f'\nAll pages are open; still waiting for {len(r.wanted())} file(s). Enter: finish. Ctrl-C: stop.')
+            if read_enter(a['poll'], stdin_open):
+                if queue:
+                    current = []       # open the next batch at the top of the loop
+                else:
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)   # the summary is printed whole
+    try:
+        return r.summary(interrupted)
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+def fetch_dir_of(src, settings):
+    d = src.get('fetch_dir') or settings.get('fetch_dir')
+    return os.path.expanduser(d) if d else None
+
+
+def fetch_updates(settings, srcs, results, o):
+    """upwatch --fetch: the Nexus file updates of the check, each to its source's fetch_dir."""
+    byname = {s['name']: s for s in srcs}
+    files, skipped = [], []
+    for path, name, r in results:
+        if not r.get('update') or r.get('error') or r.get('hold'):
+            continue                     # the check output already says why (E line; held on purpose)
+        t = f'{name} {r["latest"]}' if r.get('latest') else name
+        if r.get('bad'):
+            skipped.append((t, 'archive md5 not found on Nexus for this mod'))
+            continue
+        if not (r.get('latest_file_id') and r.get('latest_file') and r.get('nexus_id')):
+            skipped.append((t, 'not a Nexus file'))
+            continue
+        src = byname.get(path) or byname.get(path.split('/', 1)[0])
+        d = fetch_dir_of(src, settings) if src else None
+        if not d:
+            skipped.append((t, f'no fetch_dir for {src["name"] if src else path}'))
+            continue
+        link = r.get('link') or ''
+        m = re.search(r'/([a-z0-9]+)/mods/\d+', urllib.parse.urlsplit(link).path)
+        files.append({'mod': name, 'id': r.get('id'), 'version': r.get('latest'),
+                      'game': m.group(1) if m else src.get('game', 'witcher3'), 'nexus_mod_id': r['nexus_id'],
+                      'file_id': r['latest_file_id'], 'url': link or None, 'file_name': r['latest_file'],
+                      'size': r.get('latest_size') if _int(r.get('latest_size')) else None, 'md5': None, 'dest': d})
+    print()
+    if not files:
+        for t, why in skipped:
+            print(f'{t}: skipped ({why})')
+        print('fetch: no Nexus file updates to fetch')
+        return 0
+    entries, probs = check_entries([{k: v for k, v in f.items() if v is not None or k in ('size', 'md5')} for f in files])
+    if probs:
+        fetch_die('the updates cannot be fetched as they are, nothing was done:\n  ' + '\n  '.join(probs))
+    a = dict(o['fopt'], verbose=o['verbose'])
+    a['downloads'] = a['downloads'] or os.path.expanduser(settings.get('downloads_dir') or '~/Downloads')
+    return fetch_run(a, entries, {e['dest']: Path(e['dest']) for e in entries}, skipped)
+
+
+def fetch_wants(settings, path, o):
+    """upwatch fetch FILE: a want-list; its "inbox" and "archive" entries go to inbox_dir / archive_dir."""
+    entries = load_wants(path)
+    a = dict(o['fopt'], verbose=o['verbose'])
+    a['downloads'] = a['downloads'] or os.path.expanduser(settings.get('downloads_dir') or '~/Downloads')
+    dirs = {}
+    for k in sorted({e['dest'] for e in entries}):
+        d = a.get(f'{k}_dir') or settings.get(f'{k}_dir')
+        if not d:
+            fetch_die(f'the want-list has "{k}" entries, but {k}_dir is not set in [settings] of {CONFIG} (or --{k}-dir DIR)')
+        dirs[k] = Path(os.path.expanduser(d))
+    return fetch_run(a, entries, dirs)
+
+# ---------------------------------------------------------------- fetch: end
+
+
+
 def parse(argv):
-    cmd = argv[0] if argv and argv[0] in ('check', 'list', 'ack', 'init') else 'check'
+    cmd = argv[0] if argv and argv[0] in ('check', 'list', 'ack', 'init', 'fetch') else 'check'
     rest = argv[1:] if argv and argv[0] == cmd else argv
-    o = dict(cmd=cmd, names=[], top=False, tags=[], verbose=False, json=False, notify=False, quiet=False, wait=0)
+    o = dict(cmd=cmd, names=[], top=False, tags=[], verbose=False, json=False, notify=False, quiet=False, wait=0,
+             fetch=False, fopt=dict(FETCH_DEFAULTS), fset=[])
     it = iter(rest)
+
+    def num(opt, kind=float):
+        v = next(it, None)
+        try:
+            return kind(v)
+        except (TypeError, ValueError):
+            fetch_die(f'{opt} needs a number; see upwatch --help')
+
+    def word(opt):
+        v = next(it, None)
+        if v is None:
+            fetch_die(f'{opt} needs a value; see upwatch --help')
+        return v
     for a in it:
         if a in ('-h', '--help'):
             print(__doc__); sys.exit(0)
@@ -572,12 +1430,28 @@ def parse(argv):
         elif a.startswith('--tag='): o['tags'].append(a[6:])
         elif a in ('-v', '--verbose'): o['verbose'] = True
         elif a == '--json': o['json'] = True
+        elif a == '--fetch': o['fetch'] = True
+        elif a in ('--dry-run', '--yes'): o['fopt'][a[2:].replace('-', '_')] = True; o['fset'].append(a)
+        elif a == '--batch': o['fopt']['batch'] = num(a, int); o['fset'].append(a)
+        elif a == '--gap': o['fopt']['gap'] = [num(a), num(a)]; o['fset'].append(a)
+        elif a in ('--settle', '--poll'): o['fopt'][a[2:]] = num(a); o['fset'].append(a)
+        elif a in ('--downloads', '--opener', '--report', '--inbox-dir', '--archive-dir'):
+            v = word(a)
+            o['fopt'][a[2:].replace('-', '_')] = os.path.expanduser(v) if a != '--opener' else v
+            o['fset'].append(a)
         elif a == '--notify': o['notify'] = True
         elif a in ('-q', '--quiet'): o['quiet'] = True
         elif a == '--wait-network': o['wait'] = int(next(it, '0'))
         elif a.startswith('--wait-network='): o['wait'] = int(a.split('=', 1)[1])
         elif a.startswith('-'): raise SystemExit(f'unknown option {a}; see upwatch --help')
         else: o['names'].append(a)
+    f = o['fopt']
+    if not 1 <= f['batch'] <= MAX_BATCH:
+        fetch_die(f'--batch must be 1 to {MAX_BATCH}')
+    if f['gap'][0] < 1 or f['gap'][1] < f['gap'][0]:
+        fetch_die('--gap MIN MAX needs 1 <= MIN <= MAX')
+    if f['settle'] < 0.5 or f['poll'] < 0.1:
+        fetch_die('--settle must be at least 0.5 and --poll at least 0.1')
     return o
 
 
@@ -590,6 +1464,24 @@ def main(argv):
         open(CONFIG, 'w').write(EXAMPLE)
         print(f'wrote {CONFIG}')
         return 0
+    fetching = o['fetch'] or o['cmd'] == 'fetch'
+    if o['fset'] and not fetching:
+        fetch_die(f'{o["fset"][0]} is a fetch option: use it with --fetch or upwatch fetch FILE')
+    if any(x in o['fset'] for x in ('--inbox-dir', '--archive-dir')) and o['cmd'] != 'fetch':
+        fetch_die('--inbox-dir and --archive-dir are for upwatch fetch FILE (with --fetch, use fetch_dir in the config)')
+    if fetching:        # interactive only: a timer or a pipe must never open browser pages
+        what = '--fetch' if o['cmd'] != 'fetch' else 'fetch'
+        why = ('only with check' if o['cmd'] not in ('check', 'fetch') or (o['fetch'] and o['cmd'] == 'fetch')
+               else 'not with --notify or --quiet' if o['notify'] or o['quiet']
+               else 'not with --json' if o['json'] else 'only in a terminal' if not (sys.stdin.isatty() and sys.stdout.isatty())
+               else '')
+        if why:
+            print(f'upwatch: {what} is {why}; nothing fetched', file=sys.stderr)
+            return 2
+    if o['cmd'] == 'fetch':
+        if len(o['names']) != 1 or o['top'] or o['tags'] or o['wait']:
+            fetch_die('usage: upwatch fetch WANTS.json [FETCH OPTIONS]')
+        return fetch_wants(load_config()[0] if os.path.exists(CONFIG) else {}, o['names'][0], o)
     settings, srcs = load_config()
     if o['cmd'] == 'ack':
         if not o['names']:
@@ -634,7 +1526,7 @@ def main(argv):
     state['last_run'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
     save_state(state)
     if o['json']:
-        print(json.dumps([dict(path=p, name=n, **r) for p, n, r in results], indent=1))
+        print(json.dumps(as_json(results), indent=1))
         return 0
     shown = 0
     for path, name, r in results:
@@ -652,6 +1544,8 @@ def main(argv):
         if g:
             print(f'GitHub API left: {g[0]}/{g[1]} this hour')
         print(f'TIME {time.time() - t0:.1f} s')
+    if o['fetch']:
+        return fetch_updates(settings, srcs, results, o)
     return 0
 
 
